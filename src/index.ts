@@ -1,27 +1,68 @@
-import { Env } from './types';
+import { Env, TrackedProduct } from './types';
 import { handleApiRequest } from './api';
 import { scrapeGoogleShopping } from './scraper';
 import { getActiveProducts, storeSnapshots } from './db';
 
+async function runScrape(env: Env, products?: TrackedProduct[]): Promise<{ success: number; fail: number; details: any[] }> {
+  const toScrape = products || await getActiveProducts(env);
+  let success = 0;
+  let fail = 0;
+  const details: any[] = [];
+
+  for (const product of toScrape) {
+    try {
+      const results = await scrapeGoogleShopping(env, product);
+      if (results.length > 0) {
+        await storeSnapshots(env, product, results);
+        success++;
+        details.push({ sku: product.sku, status: 'ok', count: results.length, sample: results.slice(0, 3) });
+      } else {
+        fail++;
+        details.push({ sku: product.sku, status: 'no_results' });
+      }
+      // Small delay between API calls
+      await new Promise(r => setTimeout(r, 500));
+    } catch (err: any) {
+      fail++;
+      details.push({ sku: product.sku, status: 'error', error: err.message });
+    }
+  }
+
+  return { success, fail, details };
+}
+
 export default {
-  /**
-   * HTTP handler — serves the REST API for the admin dashboard
-   */
   async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
     const url = new URL(request.url);
 
-    // Health check
     if (url.pathname === '/' || url.pathname === '/health') {
       return new Response(JSON.stringify({
-        service: 'price-scout',
-        status: 'ok',
-        timestamp: new Date().toISOString()
-      }), {
+        service: 'price-scout', status: 'ok', timestamp: new Date().toISOString()
+      }), { headers: { 'Content-Type': 'application/json' } });
+    }
+
+    // Manual scrape — all products
+    if (url.pathname === '/api/scrape' && request.method === 'POST') {
+      const result = await runScrape(env);
+      return new Response(JSON.stringify(result), {
         headers: { 'Content-Type': 'application/json' }
       });
     }
 
-    // API routes
+    // Manual scrape — single product
+    if (url.pathname.match(/^\/api\/scrape\/\d+$/) && request.method === 'POST') {
+      const id = parseInt(url.pathname.split('/').pop()!);
+      const product = await env.DB.prepare('SELECT * FROM tracked_products WHERE id = ?')
+        .bind(id).first<TrackedProduct>();
+      if (!product) {
+        return new Response(JSON.stringify({ error: 'Product not found' }), { status: 404 });
+      }
+      const result = await runScrape(env, [product]);
+      return new Response(JSON.stringify(result), {
+        headers: { 'Content-Type': 'application/json' }
+      });
+    }
+
     if (url.pathname.startsWith('/api/')) {
       return handleApiRequest(request, env);
     }
@@ -29,40 +70,8 @@ export default {
     return new Response('Not found', { status: 404 });
   },
 
-  /**
-   * Cron handler — daily scraping run
-   */
   async scheduled(event: ScheduledEvent, env: Env, ctx: ExecutionContext): Promise<void> {
-    console.log(`[price-scout] Cron triggered at ${new Date().toISOString()}`);
-
-    const products = await getActiveProducts(env);
-    console.log(`[price-scout] Found ${products.length} active products to scrape`);
-
-    let successCount = 0;
-    let failCount = 0;
-
-    for (const product of products) {
-      try {
-        console.log(`[price-scout] Scraping: "${product.search_query}" (SKU: ${product.sku})`);
-        const results = await scrapeGoogleShopping(env, product);
-
-        if (results.length > 0) {
-          await storeSnapshots(env, product, results);
-          successCount++;
-          console.log(`[price-scout] ✓ ${product.sku}: ${results.length} results stored`);
-        } else {
-          failCount++;
-          console.log(`[price-scout] ✗ ${product.sku}: no results`);
-        }
-
-        // Small delay between requests to be respectful
-        await new Promise(resolve => setTimeout(resolve, 2000));
-      } catch (err) {
-        failCount++;
-        console.error(`[price-scout] Error scraping ${product.sku}:`, err);
-      }
-    }
-
-    console.log(`[price-scout] Cron complete: ${successCount} success, ${failCount} failed`);
+    const result = await runScrape(env);
+    console.log(`[price-scout] Cron: ${result.success} ok, ${result.fail} failed`);
   }
 };

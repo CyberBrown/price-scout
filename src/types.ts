@@ -1,6 +1,7 @@
 export interface Env {
   DB: D1Database;
   BROWSER: Fetcher;
+  SERPER_API_KEY: string;
   ENVIRONMENT: string;
 }
 

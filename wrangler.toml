@@ -9,7 +9,7 @@ crons = ["0 6 * * *"]  # Daily at 6am UTC
 [[d1_databases]]
 binding = "DB"
 database_name = "price-scout-db"
-database_id = "" # Will be filled after creation
+database_id = "dbc6c5ce-3303-435e-bbd5-c5be665c03b9"
 
 [browser]
 binding = "BROWSER"

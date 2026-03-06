@@ -1,139 +1,60 @@
 import { Env, TrackedProduct, GoogleShoppingResult } from './types';
 
-const GOOGLE_SHOPPING_BASE = 'https://www.google.com/search?tbm=shop&q=';
+const SERPER_API = 'https://google.serper.dev/shopping';
 
 /**
- * Scrape Google Shopping using CF Browser Rendering REST API /json endpoint.
- * Falls back to /screenshot if structured extraction fails.
+ * Scrape Google Shopping via Serper.dev API
+ * Free tier: 2,500 searches/month (we need ~210/month for 7 products daily)
  */
 export async function scrapeGoogleShopping(
   env: Env,
   product: TrackedProduct
 ): Promise<GoogleShoppingResult[]> {
-  const searchUrl = `${GOOGLE_SHOPPING_BASE}${encodeURIComponent(product.search_query)}`;
-
   try {
-    // Attempt 1: Use /json endpoint for structured extraction
-    const results = await extractWithJson(env, searchUrl, product);
-    if (results.length > 0) return results;
+    const response = await fetch(SERPER_API, {
+      method: 'POST',
+      headers: {
+        'X-API-KEY': env.SERPER_API_KEY,
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify({
+        q: product.search_query,
+        gl: 'us',
+        hl: 'en',
+        num: 20
+      })
+    });
 
-    // Attempt 2: Use /markdown endpoint and parse
-    const markdownResults = await extractWithMarkdown(env, searchUrl, product);
-    if (markdownResults.length > 0) return markdownResults;
+    if (!response.ok) {
+      const errText = await response.text();
+      console.log('[price-scout] Serper API error ' + response.status + ': ' + errText.substring(0, 200));
+      return [];
+    }
 
-    console.log(`[price-scout] No results extracted for "${product.search_query}", will need Playwright fallback`);
-    return [];
+    const data = await response.json() as any;
+    const shopping = data.shopping || [];
+
+    return shopping.map(function(item: any) {
+      return {
+        title: item.title || 'Unknown',
+        price: typeof item.price === 'number' ? item.price : parsePrice(item.price),
+        currency: 'USD',
+        seller: item.source || item.merchant || 'Unknown',
+        url: item.link || '',
+        shipping: item.delivery || item.shipping || undefined
+      };
+    }).filter(function(r: GoogleShoppingResult) { return r.price > 0; });
+
   } catch (err) {
-    console.error(`[price-scout] Scrape failed for "${product.search_query}":`, err);
+    console.error('[price-scout] Scrape failed for "' + product.search_query + '":', err);
     return [];
   }
 }
 
-/**
- * Try CF Browser Rendering /json endpoint
- */
-async function extractWithJson(
-  env: Env,
-  url: string,
-  product: TrackedProduct
-): Promise<GoogleShoppingResult[]> {
-  const response = await env.BROWSER.fetch('https://api.cloudflare.com/client/v4/accounts/browser-rendering/json', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      url,
-      prompt: 'Extract all product listings with their title, price (as number), currency, seller name, product URL, and shipping info. Return as JSON array.',
-      responseSchema: {
-        type: 'array',
-        items: {
-          type: 'object',
-          properties: {
-            title: { type: 'string' },
-            price: { type: 'number' },
-            currency: { type: 'string' },
-            seller: { type: 'string' },
-            url: { type: 'string' },
-            shipping: { type: 'string' }
-          },
-          required: ['title', 'price', 'seller']
-        }
-      }
-    })
-  });
-
-  if (!response.ok) {
-    console.log(`[price-scout] /json endpoint returned ${response.status}`);
-    return [];
-  }
-
-  const data = await response.json() as GoogleShoppingResult[];
-  return Array.isArray(data) ? data : [];
-}
-
-/**
- * Fallback: Use /markdown endpoint and parse pricing patterns
- */
-async function extractWithMarkdown(
-  env: Env,
-  url: string,
-  product: TrackedProduct
-): Promise<GoogleShoppingResult[]> {
-  const response = await env.BROWSER.fetch('https://api.cloudflare.com/client/v4/accounts/browser-rendering/markdown', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ url })
-  });
-
-  if (!response.ok) {
-    console.log(`[price-scout] /markdown endpoint returned ${response.status}`);
-    return [];
-  }
-
-  const markdown = await response.text();
-  return parseMarkdownPricing(markdown);
-}
-
-/**
- * Parse pricing data from markdown text
- * Looks for common patterns: $XX.XX, seller names, product titles
- */
-function parseMarkdownPricing(markdown: string): GoogleShoppingResult[] {
-  const results: GoogleShoppingResult[] = [];
-  const pricePattern = /\$(\d{1,6}(?:,\d{3})*(?:\.\d{2})?)/g;
-  const lines = markdown.split('\n');
-
-  let currentTitle = '';
-  let currentSeller = '';
-
-  for (const line of lines) {
-    const trimmed = line.trim();
-    if (!trimmed) continue;
-
-    // Capture headings or bold text as potential titles
-    const headingMatch = trimmed.match(/^#+\s+(.+)$/) || trimmed.match(/\*\*(.+?)\*\*/);
-    if (headingMatch) {
-      currentTitle = headingMatch[1];
-    }
-
-    // Look for prices
-    const priceMatch = trimmed.match(pricePattern);
-    if (priceMatch && currentTitle) {
-      const priceStr = priceMatch[0].replace(/[$,]/g, '');
-      const price = parseFloat(priceStr);
-      if (!isNaN(price) && price > 0) {
-        results.push({
-          title: currentTitle,
-          price,
-          currency: 'USD',
-          seller: currentSeller || 'Unknown',
-          url: '',
-          shipping: undefined
-        });
-        currentTitle = '';
-        currentSeller = '';
-      }
-    }
-  }
-
-  return results;
+function parsePrice(priceStr: any): number {
+  if (typeof priceStr === 'number') return priceStr;
+  if (typeof priceStr !== 'string') return 0;
+  const match = priceStr.match(/([\d,]+\.?\d*)/);
+  if (!match) return 0;
+  return parseFloat(match[1].replace(/,/g, ''));
 }
