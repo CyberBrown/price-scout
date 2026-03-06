@@ -31,6 +31,8 @@ export async function handleApiRequest(request: Request, env: Env): Promise<Resp
       response = await bulkImport(request, env);
     } else if (path === '/api/products/activate' && request.method === 'POST') {
       response = await activateProducts(request, env);
+    } else if (path === '/api/products/with-prices' && request.method === 'GET') {
+      response = await getProductsWithPrices(env, url);
     } else if (path.match(/^\/api\/products\/\d+$/) && request.method === 'PUT') {
       const id = parseInt(path.split('/').pop()!);
       response = await updateProduct(id, request, env);
@@ -217,6 +219,63 @@ async function getStats(env: Env): Promise<Response> {
     active_products: active?.c || 0,
     products_with_price: withPrice?.c || 0,
     total_snapshots: snapshotCount?.c || 0,
+  });
+}
+
+
+async function getProductsWithPrices(env: Env, url: URL): Promise<Response> {
+  const limit = parseInt(url.searchParams.get('limit') || '50');
+  const offset = parseInt(url.searchParams.get('offset') || '0');
+
+  // Get products that have price snapshots, with min/max/avg competitor prices
+  const { results } = await env.DB.prepare(
+    `SELECT
+      p.id, p.sku, p.name, p.our_price, p.active,
+      COUNT(DISTINCT s.seller) as seller_count,
+      COUNT(s.id) as snapshot_count,
+      MIN(s.price) as min_price,
+      MAX(s.price) as max_price,
+      ROUND(AVG(s.price), 2) as avg_price,
+      MAX(s.scraped_at) as last_scraped
+    FROM tracked_products p
+    INNER JOIN price_snapshots s ON s.product_id = p.id
+    WHERE p.active = 1
+    GROUP BY p.id
+    ORDER BY p.our_price DESC NULLS LAST
+    LIMIT ? OFFSET ?`
+  ).bind(limit, offset).all();
+
+  // For each product, get the top sellers (lowest prices)
+  const enriched = [];
+  for (const prod of (results || [])) {
+    const { results: sellers } = await env.DB.prepare(
+      `SELECT seller, MIN(price) as price, url
+       FROM price_snapshots
+       WHERE product_id = ?
+       GROUP BY seller
+       ORDER BY price ASC
+       LIMIT 10`
+    ).bind(prod.id).all();
+
+    enriched.push({
+      ...prod,
+      sellers: sellers || []
+    });
+  }
+
+  // Total count for pagination
+  const total = await env.DB.prepare(
+    `SELECT COUNT(DISTINCT p.id) as c
+     FROM tracked_products p
+     INNER JOIN price_snapshots s ON s.product_id = p.id
+     WHERE p.active = 1`
+  ).first<{c: number}>();
+
+  return json({
+    products: enriched,
+    total: total?.c || 0,
+    limit,
+    offset
   });
 }
 
